@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7,33 +8,35 @@
   <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
   <style>
     body {
-      background-color: #001a00;
+      background-color: #002d00;
       color: #39ff14;
       font-family: monospace;
       padding: 20px;
     }
-    input, select, button {
+    button {
+      background: #39ff14;
+      color: #002d00;
+      padding: 10px;
       margin: 5px;
-      padding: 5px;
-      background-color: #002b00;
-      color: #39ff14;
-      border: 1px solid #39ff14;
-      border-radius: 4px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    input, select {
+      padding: 8px;
+      margin: 5px;
     }
     .log {
+      white-space: pre-wrap;
       border: 1px solid #39ff14;
       padding: 10px;
       margin-top: 20px;
-      height: 300px;
+      max-height: 300px;
       overflow-y: auto;
-      background-color: #000;
     }
-    .log-entry {
-      border-bottom: 1px dashed #39ff14;
-      margin-bottom: 5px;
-      padding-bottom: 5px;
+    .log div {
+      margin-bottom: 8px;
     }
-    .log-entry.profit {
+    .log .green {
       color: #00ff00;
       font-weight: bold;
     }
@@ -42,20 +45,62 @@
 <body>
   <h1>DODO Flash Loan Arbitrage</h1>
 
-  <label>Token Address: <input id="token" type="text" /></label><br/>
-  <label>Manual Bribe (in GWEI): <input id="bribe" type="number" value="0.005" /></label><br/>
-  <button onclick="start()">Start Arbitrage</button>
+  <div>
+    <button id="connect">Connect Wallet</button>
+    <span id="wallet"></span>
+    <span id="usdcBalance"></span>
+  </div>
+
+  <div>
+    <label>Select Token:</label>
+    <select id="token1"></select>
+  </div>
+
+  <div>
+    <label>Trade Amount (USDC):</label>
+    <input id="tradeAmount" type="number" value="1000" step="0.00000000001">
+    <label>Min Profit (USDC):</label>
+    <input id="minProfit" type="number" value="0.00000000001" step="0.00000000001">
+    <label>Slippage (bps):</label>
+    <input id="slippage" type="number" value="5">
+    <label>Scan Interval (sec):</label>
+    <input id="scanInterval" type="number" value="10" min="1" step="1">
+  </div>
+
+  <div>
+    <label>Manual Bribe (GWEI):</label>
+    <input id="manualBribe" type="number" value="0" step="0.01">
+    <label>Retry Failed TX:</label>
+    <input id="retryTx" type="checkbox">
+  </div>
+
+  <div>
+    <label>Gas Setting:</label>
+    <select id="gasOption">
+      <option value="dynamic">Dynamic</option>
+      <option value="fast">Fast</option>
+      <option value="turbo">Turbo</option>
+    </select>
+  </div>
+
+  <div>
+    <button id="approve">Approve USDC</button>
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <button id="autoscan">AutoScan All</button>
+  </div>
+
+  <div>
+    <label>Autotrade:</label><input type="checkbox" id="autotrade">
+    <label>Only When Profitable:</label><input type="checkbox" id="onlyProfitable" checked>
+    <label>Use Flash Loan:</label><input type="checkbox" id="useFlashLoan">
+  </div>
+
   <div class="log" id="log"></div>
 
   <script>
-    const RPCs = [
-      "https://polygon-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
-      "https://rpc.ankr.com/polygon",
-      "https://polygon-rpc.com"
-    ];
-
     const contractAddress = "0x2498Bc50732a655F0DbEa3319B1Cd7DDec884b6a";
-    const contractABI = [
+    const abi = [
 	{
 		"inputs": [
 			{
@@ -497,55 +542,146 @@
 	}
 ];
 
-    const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+    const tokens = {
+      AAVE: "0x8dff5e27ea6b7ac08ebfdf9eb090f32ee9a30fcf",
+      WBTC: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
+      UNI:  "0xb33eaad8d922b1083446dc23f610c2567fb5180f",
+      USDC: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+      DAI:  "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+      USDT: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+      SHIB: "0x6f8a06447ff6fcf75d803135a7de15ce88c1d4ec",
+      CRV:  "0x172370d5cd63279efa6d502dab29171933a610af",
+      LINK: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39",
+      WETH: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"
+    };
 
-    function log(msg, isProfit = false) {
-      const logDiv = document.getElementById("log");
-      const entry = document.createElement("div");
-      entry.className = "log-entry" + (isProfit ? " profit" : "");
-      entry.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}`;
-      logDiv.prepend(entry);
+    const tokenSelect = document.getElementById('token1');
+    Object.entries(tokens).forEach(([name, addr]) => {
+      const option = document.createElement('option');
+      option.value = addr;
+      option.text = name;
+      tokenSelect.appendChild(option);
+    });
+
+    let provider, signer, contract, scanning = false, autoscanActive = false, intervalId;
+
+    const log = (msg, isProfit = false) => {
+      const timestamp = new Date().toLocaleTimeString();
+      const line = document.createElement('div');
+      line.textContent = `[${timestamp}] ${msg}`;
+      if (isProfit) line.classList.add('green');
+      document.getElementById('log').prepend(line);
+    };
+
+    async function sendArbitrageWithFallback(token1Addr, manualBribe) {
+      const fallbackRPCs = [
+        'https://polygon-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY',
+        'https://polygon-rpc.com',
+        'https://rpc.ankr.com/polygon'
+      ];
+
+      for (let i = 0; i < fallbackRPCs.length; i++) {
+        try {
+          const fallbackProvider = new ethers.providers.JsonRpcProvider(fallbackRPCs[i]);
+          const web3Provider = new ethers.providers.Web3Provider(window.ethereum);
+          const fallbackSigner = web3Provider.getSigner();
+          const fallbackContract = new ethers.Contract(contractAddress, abi, fallbackSigner.connect(fallbackProvider));
+
+          const tx = await fallbackContract.initiateArbitrage(tokens.USDC, token1Addr, manualBribe, {
+            gasLimit: ethers.utils.hexlify(1_500_000)
+          });
+          await tx.wait();
+          log(`✅ Transaction success via RPC #${i + 1}`, true);
+          return true;
+        } catch (err) {
+          log(`❌ RPC #${i + 1} failed: ${err.message}`);
+        }
+      }
+      log("⛔ All fallback providers failed.");
+      return false;
     }
 
-    async function sendWithFallback(txPopulator) {
-      for (let i = 0; i < RPCs.length; i++) {
-        try {
-          const provider = new ethers.providers.JsonRpcProvider(RPCs[i]);
-          const signer = new ethers.providers.Web3Provider(window.ethereum).getSigner();
-          const contract = new ethers.Contract(contractAddress, contractABI, signer.connect(provider));
+    async function updateUSDCBalance() {
+      const usdc = new ethers.Contract(tokens.USDC, ["function balanceOf(address) view returns (uint256)"], provider);
+      const balance = await usdc.balanceOf(await signer.getAddress());
+      document.getElementById('usdcBalance').innerText = ` | USDC: ${ethers.utils.formatUnits(balance, 6)}`;
+    }
 
-          const tx = await txPopulator(contract);
-          const sent = await signer.sendTransaction(tx);
-          const receipt = await sent.wait();
+    document.getElementById('connect').onclick = async () => {
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      signer = provider.getSigner();
+      contract = new ethers.Contract(contractAddress, abi, signer);
+      document.getElementById('wallet').innerText = await signer.getAddress();
+      await updateUSDCBalance();
+      log("Wallet connected");
+    };
 
-          log(`✅ Success via RPC ${i + 1}: ${RPCs[i]} | Tx Hash: ${receipt.transactionHash}`, true);
-          return;
-        } catch (err) {
-          log(`❌ Failed with RPC ${i + 1}: ${RPCs[i]} | ${err.message}`);
-          if (i === RPCs.length - 1) {
-            log("⛔ All providers failed to send transaction.");
+    document.getElementById('approve').onclick = async () => {
+      const usdc = new ethers.Contract(tokens.USDC, ["function approve(address,uint256) public returns(bool)"], signer);
+      await usdc.approve(contractAddress, ethers.constants.MaxUint256);
+      log("USDC approved");
+    };
+
+    async function scanSingle(token1Addr) {
+      const router1 = new ethers.Contract("0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff", ["function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory)"], provider);
+      const router2 = new ethers.Contract("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506", ["function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory)"], provider);
+      const tradeAmount = ethers.utils.parseUnits(document.getElementById('tradeAmount').value, 6);
+      const minProfit = parseFloat(document.getElementById('minProfit').value);
+      try {
+        const out1 = await router1.getAmountsOut(tradeAmount, [tokens.USDC, token1Addr]);
+        const out2 = await router2.getAmountsOut(tradeAmount, [tokens.USDC, token1Addr]);
+        const price1 = parseFloat(ethers.utils.formatUnits(tradeAmount, 6)) / parseFloat(ethers.utils.formatUnits(out1[1], 18));
+        const price2 = parseFloat(ethers.utils.formatUnits(tradeAmount, 6)) / parseFloat(ethers.utils.formatUnits(out2[1], 18));
+        const profitPerToken = price2 - price1;
+        const totalProfit = profitPerToken * parseFloat(ethers.utils.formatUnits(out1[1], 18));
+        const symbol = Object.keys(tokens).find(key => tokens[key] === token1Addr);
+        log(`Profit: $${totalProfit.toFixed(6)} (${((profitPerToken / price1) * 100).toFixed(2)}%) on ${symbol}`, totalProfit > 0);
+
+        if (document.getElementById('autotrade').checked && totalProfit >= minProfit) {
+          const manualBribe = ethers.utils.parseUnits(document.getElementById('manualBribe').value || '0', 'gwei');
+          const retry = document.getElementById('retryTx').checked;
+          log("Executing arbitrage...");
+          const success = await sendArbitrageWithFallback(token1Addr, manualBribe);
+          if (!success && retry) {
+            log("Retrying...");
+            await sendArbitrageWithFallback(token1Addr, manualBribe);
           }
+          await updateUSDCBalance();
         }
+      } catch (e) {
+        log(`Error: ${e.message}`);
       }
     }
 
-    async function start() {
-      await window.ethereum.request({ method: 'eth_requestAccounts' });
-      const tokenAddress = document.getElementById("token").value;
-      const bribeGwei = parseFloat(document.getElementById("bribe").value || "0");
-      const bribeWei = ethers.utils.parseUnits(bribeGwei.toString(), "gwei");
+    document.getElementById('start').onclick = () => {
+      scanning = true;
+      const token1 = document.getElementById('token1').value;
+      const intervalSec = parseInt(document.getElementById('scanInterval').value) || 10;
+      log(`Started scanning ${token1} every ${intervalSec} sec`);
+      clearInterval(intervalId);
+      intervalId = setInterval(() => scanSingle(token1), intervalSec * 1000);
+    };
 
-      log("Preparing arbitrage transaction...");
+    document.getElementById('stop').onclick = () => {
+      clearInterval(intervalId);
+      scanning = false;
+      autoscanActive = false;
+      log("Stopped scanning");
+    };
 
-      await sendWithFallback(async (contract) => {
-        const txRequest = await contract.populateTransaction.initiateArbitrage(
-          USDC_ADDRESS,
-          tokenAddress,
-          bribeWei
-        );
-        return txRequest;
-      });
-    }
+    document.getElementById('autoscan').onclick = () => {
+      autoscanActive = true;
+      const intervalSec = parseInt(document.getElementById('scanInterval').value) || 10;
+      log("AutoScan All started");
+      clearInterval(intervalId);
+      intervalId = setInterval(async () => {
+        for (const tokenAddr of Object.values(tokens)) {
+          if (!autoscanActive) return;
+          await scanSingle(tokenAddr);
+        }
+      }, intervalSec * 1000);
+    };
   </script>
 </body>
 </html>
